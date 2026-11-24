@@ -164,9 +164,15 @@ def apply_config_update(instance, current, message):
         voice.use_f0,
         voice.tgt_sr,
     )
-    voice.decoder_fp16 = bool(
-        candidate.get("decoder_fp16", False)
-    ) and voice.vocoder in ("HiFi-GAN", "MRF HiFi-GAN")
+    # Only override the precision-derived default when the UI actually sends
+    # decoder_fp16. The browser client does not send it, and forcing False here
+    # would undo the Settings -> Precision choice made at load time.
+    explicit_fp16 = candidate.get("decoder_fp16")
+    if explicit_fp16 is not None:
+        voice.decoder_fp16 = bool(explicit_fp16) and voice.vocoder in (
+            "HiFi-GAN",
+            "MRF HiFi-GAN",
+        )
     pipeline.f0_model, pipeline.f0_method = pitch_model, method
     pipeline.hubert_model, pipeline.index, pipeline.big_tsr = hubert, index, data
     pipeline.sid, pipeline.torch_sid = sid, speaker

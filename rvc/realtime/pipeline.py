@@ -23,7 +23,11 @@ from rvc.infer.pipeline import Autotune
 from rvc.lib.algorithm.synthesizers import Synthesizer
 from rvc.lib.predictors.f0 import FCPE, RMVPE, SWIFT
 from rvc.lib.utils import load_embedding, HubertModelWithFinalProj
-from rvc.realtime.precision import enable_experimental_tf32
+from rvc.realtime.precision import (
+    cuda_graphs_previously_failed,
+    enable_experimental_tf32,
+    record_cuda_graph_failure,
+)
 from rvc.infer.wrapper import ONNXRVC
 
 
@@ -52,6 +56,16 @@ class RealtimeVoiceConverter:
         # load weights and setup model network.
         self.load_model(weight_root)
         self.setup_network()
+        # Honour Settings -> Precision here too. The offline path was wired in
+        # the same change; realtime previously ignored it and always ran FP32.
+        # Only the decoder is switched: on 250 ms blocks HuBERT FP16 autocast
+        # is slower (52.7 ms -> 53.9 ms) because the win does not cover the
+        # per-call autocast overhead, while the decoder halves the block time.
+        self.decoder_fp16 = (
+            getattr(self.config, "inference_precision", None) == "fp16"
+            and self.config.device.startswith("cuda")
+            and (self.vocoder or "") in ("HiFi-GAN", "MRF HiFi-GAN")
+        )
 
     def load_model(self, weight_root):
         """
@@ -197,13 +211,16 @@ class Realtime_Pipeline:
         self._graph_cache = None
         self._graph_failed = False
         gpu_name = (vc.config.gpu_name or "").upper()
+        is_rocm = getattr(torch.version, "hip", None) is not None
         # Local opt-in experiment: preserve FP32 retrieval/synthesis features
         # while autocasting the large HuBERT network on NVIDIA CUDA.
+        # Realtime blocks are too short for the autocast win to cover its
+        # per-call overhead on ROCm: 52.7 ms -> 53.9 ms at 250 ms blocks.
         self.embedder_fp16 = (
             os.environ.get("APPLIO_EXPERIMENTAL_HUBERT_FP16") == "1"
             and str(self.device).startswith("cuda")
             and "NVIDIA" in gpu_name
-            and getattr(torch.version, "hip", None) is None
+            and not is_rocm
         )
         if self.embedder_fp16:
             print("[Experimental] HuBERT FP16 autocast enabled for realtime.")
@@ -213,10 +230,11 @@ class Realtime_Pipeline:
                 or getattr(vc.net_g.dec, "cuda_device", None) is not None
             )
             and str(self.device).startswith("cuda")
-            and "NVIDIA" in gpu_name
-            and not getattr(torch.version, "hip", None)
             and "ZLUDA" not in gpu_name
+            and (is_rocm or "NVIDIA" in gpu_name)
             and os.environ.get("APPLIO_DISABLE_CUDA_GRAPHS") != "1"
+            # A previous capture left a marker; do not retry it every restart.
+            and not cuda_graphs_previously_failed()
             # Opt in only for services whose supervisor can recover by
             # replacing the process after an invalid CUDA capture.
             and os.environ.get("APPLIO_ENABLE_CUDA_GRAPHS") == "1"
@@ -681,6 +699,7 @@ class Realtime_Pipeline:
                 self._graph_cache = (key, graph, output)
             except (RuntimeError, torch.OutOfMemoryError) as error:
                 self._graph_failed = True
+                record_cuda_graph_failure()
                 raise CudaGraphCaptureError(
                     "CUDA graph capture failed; restart with eager inference"
                 ) from error

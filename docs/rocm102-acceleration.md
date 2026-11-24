@@ -12,9 +12,16 @@ Radeon RX 7900 XTX 24 GB (`gfx1100`), Python 3.12.15.
 | Inference, 3 s clip | 0.15 s | 0.08 s | **1.92x** |
 | Training step, batch 8, BF16 | 633 ms (ROCm 10.1) | 265 ms (ROCm 10.2) | **2.39x** vs 10.1 / 2.19x vs FP32 on 10.2 |
 | Training peak VRAM, batch 8 | 4.92 GB | 3.43 GB | -30% |
+| Realtime block, 250 ms, FP16 | 52.7 ms | 26.0 ms | **2.03x** |
+| Realtime block, 250 ms, FP16 + graphs | 52.7 ms | 19.2 ms | **2.74x** |
 
 Inference quality against the FP32 baseline: **SI-SDR 51.2 dB / 51.5 dB**
 (10 s / 30 s), correlation 0.999996. That is inaudible.
+
+Realtime CUDA graphs are bit-identical to eager (max abs difference 0.0 with
+model noise disabled, FP32 and FP16). With noise enabled both paths differ from
+each other only because a captured graph freezes the RNG stream; repeating one
+block drifts in eager mode too, so that is SOLA feedback, not the graph.
 
 ## What actually pays
 
@@ -35,6 +42,21 @@ Inference quality against the FP32 baseline: **SI-SDR 51.2 dB / 51.5 dB**
 
 4. **BF16 for training** (2.19x over FP32, -30% VRAM). No loss scaling needed.
 
+5. **Realtime: FP16 decoder + CUDA graphs** (2.74x together).
+   The precision setting was not wired into realtime either, and
+   `configuration.py` / `client.py` actively forced `decoder_fp16 = False`
+   whenever the browser sent a config update, because the UI never sends that
+   key. Both now leave the precision-derived value alone unless the client
+   sends an explicit choice.
+
+   CUDA graphs were gated to NVIDIA. They work on ROCm 10.2/gfx1100: 52.7 ->
+   47.8 ms eager, and combined with FP16, 19.2 ms. The gate now admits ROCm,
+   still opt-in via `APPLIO_ENABLE_CUDA_GRAPHS=1`. Because the client does an
+   `os._exit(86)` to recover from a bad capture and nothing flips the env
+   var on restart, a failure would retry forever; captures now write
+   `~/.cache/applio/realtime-cuda-graphs-disabled` and the gate honours it.
+   Delete that file to retry.
+
 ## What does not pay
 
 - **`torch.compile`**: 1.01-1.06x on the decoder, +6% on top of BF16 training,
@@ -49,6 +71,12 @@ Inference quality against the FP32 baseline: **SI-SDR 51.2 dB / 51.5 dB**
   the decoded contour enough (9 of 1001 coarse bins, max 1 bin) that the
   synthesised audio lands at -2.3 dB SI-SDR. Rejected: F0 is the model's
   conditioning signal, not a place to trade quality for 7% of total time.
+  In realtime the F0 window is under 500 ms and takes 12.8 ms; FP16/BF16 there
+  measured 13.1 / 12.0 ms, i.e. no win, so the stage is left as is.
+- **HuBERT FP16 autocast in realtime**: slower. 250 ms blocks go from 52.7 ms
+  to 53.9 ms because the win does not cover the per-call autocast overhead.
+  Enabled for the offline path only (where it is worth 10-25% of the embedder
+  stage); realtime keeps FP32 features.
 - **Dilated-conv patch from upstream PR #1291**: not needed on ROCm 10.2.
   Dilated conv1d runs at the same speed as undilated here (0.92 ms vs 1.30 ms),
   so the startup probe correctly keeps the native MIOpen kernel. On ROCm 10.1

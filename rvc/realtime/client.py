@@ -152,9 +152,15 @@ async def websocket_audio(ws: WebSocket):
                 formant_timbre=params.get("formant_timbre", 1.0),
             )
 
-        vc_instance.vc_model.pipeline.vc.decoder_fp16 = params.get(
-            "decoder_fp16", False
-        ) and vc_instance.vc_model.pipeline.vc.vocoder in ("HiFi-GAN", "MRF HiFi-GAN")
+        # Leave the precision-derived default alone unless the client sends an
+        # explicit choice; the browser UI does not send decoder_fp16.
+        if params.get("decoder_fp16") is not None:
+            vc_instance.vc_model.pipeline.vc.decoder_fp16 = bool(
+                params["decoder_fp16"]
+            ) and vc_instance.vc_model.pipeline.vc.vocoder in (
+                "HiFi-GAN",
+                "MRF HiFi-GAN",
+            )
         # Initialize model kernels before the browser starts capturing. Audio
         # sent during model loading would otherwise remain queued and stale.
         warmup_options = dict(
