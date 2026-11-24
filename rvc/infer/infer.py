@@ -556,6 +556,15 @@ class VoiceConverter:
         """
         if self.cpt is not None:
             self.vc = VC(self.tgt_sr, self.config)
+            # FP16 vocoder autocast is opt-in through Settings -> Precision and
+            # only applies to CUDA (ROCm included). The rest of the pipeline
+            # (HuBERT features, FAISS retrieval, pitch) stays FP32.
+            fp16_inference = (
+                getattr(self.config, "inference_precision", None) == "fp16"
+                and self.config.device.startswith("cuda")
+            )
+            self.vc.decoder_fp16 = fp16_inference
+            self.vc.embedder_fp16 = fp16_inference
             # self.n_spk = self.cpt["config"][-3]
 
 

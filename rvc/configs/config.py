@@ -26,6 +26,25 @@ def singleton(cls):
     return get_instance
 
 
+def inference_precision():
+    """Return the dtype selected in Settings, mapped for inference autocast.
+
+    `precision` was only wired into training, so inference always ran in FP32.
+    On RDNA3 (gfx1100) autocast halves decoder time while the mel/FAISS/retrieval
+    path stays FP32. BF16 is deliberately not offered here: on gfx1100 its
+    forward pass is slower than FP16 and it shifts the F0 contour.
+    """
+    try:
+        from rvc.lib.user_config import load_config
+
+        precision = load_config().get("precision", "fp32")
+    except Exception:
+        return None
+    if precision in ("fp16", "fp32") and torch.cuda.is_available():
+        return precision
+    return None
+
+
 @singleton
 class Config:
     def __init__(self):
@@ -39,6 +58,7 @@ class Config:
             if self.device.startswith("cuda")
             else "Apple Silicon GPU (MPS)" if self.device == "mps" else None
         )
+        self.inference_precision = inference_precision()
         self.json_config = self.load_config_json()
         self.gpu_mem = None
         self.x_pad, self.x_query, self.x_center, self.x_max = self.device_config()

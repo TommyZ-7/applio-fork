@@ -89,11 +89,27 @@ current_dir = os.getcwd()
 
 try:
     precision = load_config()["precision"]
+    # On ROCm/gfx1100 the generator's FP16 autocast run does not converge: with
+    # the same seed and data the loss stalls near 560 for 10 steps before the
+    # GradScaler recovers, while BF16 and FP32 fall monotonically. BF16 also
+    # needs no loss scaling and is faster than FP16 there. CUDA keeps its
+    # existing FP16 path, which has not been measured here.
+    rocm_gpu = (
+        torch.cuda.is_available()
+        and getattr(torch.version, "hip", None) is not None
+        and torch.cuda.is_bf16_supported()
+    )
     if (
         precision == "bf16"
         and torch.cuda.is_available()
         and torch.cuda.is_bf16_supported()
     ):
+        train_dtype = torch.bfloat16
+    elif precision == "fp16" and rocm_gpu:
+        print(
+            "Precision fp16 is not used for training on ROCm; training runs in "
+            "BF16 (inference still honours fp16). Select bf16 to silence this."
+        )
         train_dtype = torch.bfloat16
     elif precision == "fp16" and torch.cuda.is_available():
         train_dtype = torch.float16

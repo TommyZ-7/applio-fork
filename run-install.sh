@@ -73,6 +73,56 @@ install_deps() {
     fi
 }
 
+# Detect an AMD GPU before any CUDA wheel is pulled.
+is_amd_gpu() {
+    [ "$(uname)" != "Linux" ] && return 1
+    if command -v lspci > /dev/null 2>&1; then
+        lspci 2>/dev/null | grep -Ei '(vga|3d|display)' \
+            | grep -qiE 'amd|ati|radeon|advanced micro devices'
+        return $?
+    fi
+    # No lspci: fall back to the amdgpu kernel driver.
+    [ -e /sys/module/amdgpu ] || ls /dev/kfd > /dev/null 2>&1
+}
+
+# The amdgpu kernel driver is needed by every ROCm wheel; warn instead of failing
+# so a container can still install and only fail at runtime.
+check_amdgpu_driver() {
+    if [ -e /sys/module/amdgpu ]; then
+        return 0
+    fi
+    log_error "The amdgpu kernel driver does not look loaded."
+    log_error "ROCm needs it (and /dev/kfd + /dev/dri). Install/enable it before training or inference."
+}
+
+# PyTorch for ROCm comes from AMD's own wheel index. ROCm 10.2 wheels ship
+# PyTorch 2.15 only, so the pin in requirements-engine.txt (2.11) has no ROCm
+# 10.2 build; the installer intentionally overrides it here.
+ROCM_VERSION="10.2.0"
+ROCM_INDEX="https://stable.repo.amd.com/rocm/whl-next/"
+TORCH_VERSION="2.15.0"
+TORCHVISION_VERSION="0.29.2"
+TORCHAUDIO_VERSION="2.11.1"
+
+install_rocm_torch() {
+    check_amdgpu_driver
+    if ! command -v rocminfo > /dev/null 2>&1; then
+        log_message "rocminfo not found in PATH; the pip ROCm runtime is used, so this is optional."
+    fi
+    uv pip install \
+        --index-url "$ROCM_INDEX" \
+        --extra-index-url https://pypi.org/simple \
+        --index-strategy unsafe-best-match \
+        "torch[device-all]==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
+        "torchvision==${TORCHVISION_VERSION}+rocm${ROCM_VERSION}" \
+        "torchaudio==${TORCHAUDIO_VERSION}+rocm${ROCM_VERSION}" \
+        || {
+            log_error "ROCm ${ROCM_VERSION} wheels failed to install."
+            log_error "Check the wheel index (${ROCM_INDEX}) and the Python 3.12 ABI tag, then re-run."
+            return 1
+        }
+}
+
 # Function to install FFmpeg using Flatpak
 install_ffmpeg_flatpak() {
     if command -v flatpak > /dev/null; then
@@ -142,8 +192,18 @@ create_venv() {
         export UV_HTTP_TIMEOUT=300 # for slow internet
         if [ "$(uname)" = "Darwin" ]; then
             uv pip install -r requirements.txt
-        else 
-            # nvidia-smi &>/dev/null; then
+        elif is_amd_gpu; then
+            # A CUDA index must never be used here: it silently installs a CUDA
+            # wheel on an AMD host, and every later `torch.cuda.is_available()`
+            # then fails at runtime instead of at install time.
+            log_message "AMD GPU detected; installing PyTorch for ROCm 10.2..."
+            install_rocm_torch
+            # torch/torchaudio come from the ROCm index above, so the pinned
+            # CUDA-agnostic lines are filtered out to avoid overwriting them.
+            grep -vE '^(torch|torchaudio)==' requirements-engine.txt > /tmp/applio-engine-rocm.txt
+            { echo "-r /tmp/applio-engine-rocm.txt"; grep -vE '^-r ' requirements.txt; } \
+                | uv pip install -r - --index-strategy unsafe-best-match
+        else
             uv pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match
         fi
     else
